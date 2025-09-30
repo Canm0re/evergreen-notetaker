@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useMemo, useEffect } from 'react';
 import JSZip from 'jszip';
 import { Note, ProcessingState, ProcessingStatus } from './types';
-import { processBookWithGemini } from './services/geminiService';
+import { processBookWithGrok } from './services/grokService.ts';
 import NoteList from './components/NoteList';
 import NoteView from './components/NoteView';
 import NetworkGraph from './components/NetworkGraph';
@@ -71,7 +71,7 @@ const App: React.FC = () => {
       error: null,
     }));
     try {
-      const finalNotes = await processBookWithGemini(stateToProcess, handleProgress);
+      const finalNotes = await processBookWithGrok(stateToProcess, handleProgress);
       // The final state update is handled via onProgress in the service
       if (finalNotes.length > 0) {
         setSelectedNoteId(finalNotes[0].id);
