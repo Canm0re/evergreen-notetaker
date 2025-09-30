@@ -49,6 +49,7 @@ const callGrokWithRetries = async (
         body: JSON.stringify({
           model: 'x-ai/grok-4-fast:free',
           messages: messages,
+          max_tokens: 30000,
           extra_body: {
             enable_reasoning: true
           }
