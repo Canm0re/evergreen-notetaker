@@ -1,36 +1,72 @@
-import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
 import { Note, UnlinkedNote, ProcessingState } from '../types';
 import { EXTRACT_CONCEPTS_PROMPT, GENERATE_NOTE_PROMPT, INTERLINK_SINGLE_NOTE_PROMPT } from '../constants';
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY as string });
+const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions";
+const MODEL_NAME = "x-ai/grok-4-fast:free";
 
 // Helper to add a delay between API calls
 const delay = (ms: number) => new Promise(res => setTimeout(res, ms));
 
-// Wrapper to handle API retries with exponential backoff, specifically for rate limiting.
-const callGeminiWithRetries = async (
-    apiCall: () => Promise<GenerateContentResponse>,
+// Wrapper to handle API retries with exponential backoff.
+const callOpenRouterWithRetries = async (
+    messages: { role: string; content: string }[],
     maxRetries: number = 3,
     initialDelay: number = 2000
-): Promise<GenerateContentResponse> => {
+): Promise<any> => {
     let lastError: any = null;
     for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
-            return await apiCall();
+            const response = await fetch(OPENROUTER_API_URL, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${process.env.API_KEY}`,
+                    'Content-Type': 'application/json',
+                    'HTTP-Referer': 'https://github.com/google/labs-prototypes',
+                    'X-Title': 'Evergreen Note Taker',
+                },
+                body: JSON.stringify({
+                    model: MODEL_NAME,
+                    messages: messages,
+                    max_tokens: 8192,
+                    transforms: ["reasoning"],
+                    response_format: { "type": "json_object" },
+                }),
+            });
+            
+            if (response.ok) {
+                return await response.json();
+            }
+
+            // If not ok, create an error object and throw it, so the catch block can handle it.
+            const errorInfo: any = { status: response.status };
+            try {
+                errorInfo.body = await response.json();
+            } catch {
+                errorInfo.body = { message: response.statusText };
+            }
+            throw errorInfo;
+            
         } catch (error: any) {
             lastError = error;
-            // The Gemini SDK may throw an error with a JSON string in the message
-            const isRateLimitError = error?.message?.includes('"code":429') || error?.message?.includes('RESOURCE_EXHAUSTED');
+            
+            // Check if it's a rate limit error (from the thrown object)
+            const isRateLimitError = error?.status === 429;
 
             if (isRateLimitError) {
-                const delayMs = initialDelay * Math.pow(2, attempt); // Exponential backoff: 2s, 4s, 8s...
+                const delayMs = initialDelay * Math.pow(2, attempt);
                 console.warn(
                     `Rate limit hit. Retrying in ${delayMs / 1000}s... (Attempt ${attempt + 1}/${maxRetries})`
                 );
                 await delay(delayMs);
             } else {
                 // Not a rate limit error, so we shouldn't retry.
-                throw error;
+                if (error?.body?.error?.message) {
+                    throw new Error(`API Error (${error.status}): ${error.body.error.message}`);
+                } else if (error instanceof Error) {
+                    throw error; // It was a network error etc.
+                } else {
+                    throw new Error(`An unknown API error occurred: ${JSON.stringify(error)}`);
+                }
             }
         }
     }
@@ -38,35 +74,29 @@ const callGeminiWithRetries = async (
     throw lastError;
 };
 
-// Helper function for robust JSON parsing and error handling
-const safeParseJsonResponse = <T>(response: GenerateContentResponse): T => {
-    const responseText = response.text;
+// Helper function for robust JSON parsing from OpenRouter response
+const safeParseJsonResponse = <T>(apiResponse: any): T => {
+    const contentString = apiResponse?.choices?.[0]?.message?.content;
 
-    // Sanitize first, handling potential undefined/null responseText and stripping markdown fences.
-    const sanitizedText = (responseText || '').replace(/^```json\s*/, '').replace(/\s*```$/, '').trim();
-
-    if (sanitizedText === '') {
-        console.error("Gemini API returned empty or invalid content. Full response:", JSON.stringify(response, null, 2));
+    if (!contentString || contentString.trim() === '') {
+        console.error("OpenRouter API returned empty or invalid content. Full response:", JSON.stringify(apiResponse, null, 2));
         
-        const finishReason = response.candidates?.[0]?.finishReason;
-        const safetyRatings = response.candidates?.[0]?.safetyRatings;
+        const finishReason = apiResponse.choices?.[0]?.finish_reason;
 
-        if (finishReason === 'SAFETY') {
-            const blockedRating = safetyRatings?.find(rating => rating.blocked);
-            const reason = blockedRating ? `due to ${blockedRating.category}` : '';
-            throw new Error(`The request was blocked by safety settings ${reason}. Please modify the input text.`);
+        if (finishReason === 'content_filter') {
+            throw new Error(`The request was blocked by a content filter. Please modify the input text.`);
         }
-        if (finishReason === 'MAX_TOKENS') {
+        if (finishReason === 'length' || finishReason === 'max_tokens') {
             throw new Error("The response was cut off because it reached the maximum token limit.");
         }
         
-        throw new Error("Gemini API returned an empty or invalid response. This could be due to token limits or an unreported safety block.");
+        throw new Error("OpenRouter API returned an empty or invalid response.");
     }
 
     try {
-        return JSON.parse(sanitizedText) as T;
+        return JSON.parse(contentString) as T;
     } catch (e) {
-        console.error("Failed to parse JSON response from Gemini. Sanitized response text:", sanitizedText);
+        console.error("Failed to parse JSON response from OpenRouter. Raw content:", contentString);
         if (e instanceof Error) {
             throw new Error(`Invalid JSON response from API: ${e.message}`);
         }
@@ -74,81 +104,35 @@ const safeParseJsonResponse = <T>(response: GenerateContentResponse): T => {
     }
 };
 
-// Schema for Step 1: Extracting a list of concept titles
-const titlesSchema = {
-  type: Type.ARRAY,
-  items: { type: Type.STRING },
-};
-
-// Schema for Step 2: Generating a single note body (content, quotes, source)
-const noteBodySchema = {
-    type: Type.OBJECT,
-    properties: {
-        content: { type: Type.STRING, description: 'The full explanation of the concept, without links.' },
-        quotes: {
-          type: Type.ARRAY,
-          items: { type: Type.STRING },
-          description: 'A list of 1-3 direct quotes from the book.'
-        },
-        source: { type: Type.STRING, description: 'The location in the book where the information was found.' }
-    },
-    required: ['content', 'quotes', 'source'],
-};
-
-// Schema for Step 3: Interlinking a single note
-const singleNoteLinkSchema = {
-    type: Type.OBJECT,
-    properties: {
-        content: { type: Type.STRING, description: 'The revised content of the note with [[links]] added.' }
-    },
-    required: ['content'],
-};
-
-
 // Phase 1: Identify all core concepts from the text
 const extractConcepts = async (bookContent: string): Promise<string[]> => {
-    const response = await callGeminiWithRetries(() => ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: bookContent,
-        config: {
-          systemInstruction: EXTRACT_CONCEPTS_PROMPT,
-          responseMimeType: "application/json",
-          responseSchema: titlesSchema,
-        },
-    }));
+    const messages = [
+        { role: "system", content: EXTRACT_CONCEPTS_PROMPT },
+        { role: "user", content: bookContent }
+    ];
+    const response = await callOpenRouterWithRetries(messages);
     return safeParseJsonResponse<string[]>(response);
 };
 
 // Phase 2: Generate the body for a single note based on a title
 const generateSingleNoteBody = async (bookContent: string, title: string): Promise<Omit<UnlinkedNote, 'title'>> => {
-    const prompt = `Full Text:\n${bookContent}\n\nConcept Title: "${title}"`;
-    const response = await callGeminiWithRetries(() => ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: prompt,
-        config: {
-            systemInstruction: GENERATE_NOTE_PROMPT,
-            responseMimeType: "application/json",
-            responseSchema: noteBodySchema,
-        },
-    }));
+    const messages = [
+      { role: "system", content: GENERATE_NOTE_PROMPT },
+      { role: "user", content: `Full Text:\n${bookContent}\n\nConcept Title: "${title}"` }
+    ];
+    const response = await callOpenRouterWithRetries(messages);
     return safeParseJsonResponse<Omit<UnlinkedNote, 'title'>>(response);
 };
 
 // Phase 3 Helper: Take one note and add interlinks to it
 const interlinkSingleNote = async (noteToLink: UnlinkedNote, allTitles: string[]): Promise<string> => {
     const otherTitles = allTitles.filter(t => t !== noteToLink.title);
-    const prompt = `Note Content to Revise:\n${noteToLink.content}\n\nList of Available Link Targets:\n${JSON.stringify(otherTitles, null, 2)}`;
-
-    const response = await callGeminiWithRetries(() => ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: prompt,
-        config: {
-            systemInstruction: INTERLINK_SINGLE_NOTE_PROMPT,
-            responseMimeType: "application/json",
-            responseSchema: singleNoteLinkSchema,
-        },
-    }));
-
+    const userPrompt = `Note Content to Revise:\n${noteToLink.content}\n\nList of Available Link Targets:\n${JSON.stringify(otherTitles, null, 2)}`;
+    const messages = [
+      { role: "system", content: INTERLINK_SINGLE_NOTE_PROMPT },
+      { role: "user", content: userPrompt }
+    ];
+    const response = await callOpenRouterWithRetries(messages);
     const parsed = safeParseJsonResponse<{content: string}>(response);
     return parsed.content;
 };
@@ -223,27 +207,16 @@ export const processBookWithGemini = async (
         return state.finalNotes;
 
     } catch (error: any) {
-        console.error("Error in multi-step Gemini process:", error);
+        console.error("Error in multi-step AI process:", error);
         
         let descriptiveError = "An unknown error occurred while processing the book.";
 
-        if (error && typeof error.message === 'string') {
-            try {
-                const parsedError = JSON.parse(error.message);
-                if (parsedError.error && parsedError.error.message) {
-                    descriptiveError = `API Error: ${parsedError.error.message}`;
-                } else {
-                    descriptiveError = error.message;
-                }
-            } catch (e) {
-                descriptiveError = error.message;
-            }
-        } else if (error instanceof Error) {
+        if (error instanceof Error) {
             descriptiveError = error.message;
         }
 
         // IMPORTANT: Save the error state before throwing
         onProgress({ status: 'error', error: descriptiveError });
-        throw new Error(`Failed to process book with Gemini: ${descriptiveError}`);
+        throw new Error(`Failed to process book with AI: ${descriptiveError}`);
     }
 };
