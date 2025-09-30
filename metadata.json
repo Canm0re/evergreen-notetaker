@@ -1,0 +1,5 @@
+{
+  "name": "Evergreen Note Taker",
+  "description": "An application to deconstruct complex texts into a network of atomic, insightful, and densely linked Evergreen notes using AI.",
+  "requestFramePermissions": []
+}
