@@ -1,6 +1,6 @@
 import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
 import { Note, UnlinkedNote, ProcessingState } from '../types';
-import { EXTRACT_CONCEPTS_PROMPT, GENERATE_NOTE_PROMPT, INTERLINK_NOTES_PROMPT } from '../constants';
+import { EXTRACT_CONCEPTS_PROMPT, GENERATE_NOTE_PROMPT, INTERLINK_SINGLE_NOTE_PROMPT } from '../constants';
 
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY as string });
 
@@ -42,8 +42,11 @@ const callGeminiWithRetries = async (
 const safeParseJsonResponse = <T>(response: GenerateContentResponse): T => {
     const responseText = response.text;
 
-    if (!responseText || responseText.trim() === '') {
-        console.error("Gemini API returned an empty response text. Full response:", JSON.stringify(response, null, 2));
+    // Sanitize first, handling potential undefined/null responseText and stripping markdown fences.
+    const sanitizedText = (responseText || '').replace(/^```json\s*/, '').replace(/\s*```$/, '').trim();
+
+    if (sanitizedText === '') {
+        console.error("Gemini API returned empty or invalid content. Full response:", JSON.stringify(response, null, 2));
         
         const finishReason = response.candidates?.[0]?.finishReason;
         const safetyRatings = response.candidates?.[0]?.safetyRatings;
@@ -57,16 +60,13 @@ const safeParseJsonResponse = <T>(response: GenerateContentResponse): T => {
             throw new Error("The response was cut off because it reached the maximum token limit.");
         }
         
-        throw new Error("Gemini API returned an empty or invalid response.");
+        throw new Error("Gemini API returned an empty or invalid response. This could be due to token limits or an unreported safety block.");
     }
 
     try {
-        // Sanitize the response text before parsing. The API might return
-        // markdown fences (```json ... ```) which need to be stripped.
-        const sanitizedText = responseText.replace(/^```json\s*/, '').replace(/\s*```$/, '');
         return JSON.parse(sanitizedText) as T;
     } catch (e) {
-        console.error("Failed to parse JSON response from Gemini. Response text:", responseText);
+        console.error("Failed to parse JSON response from Gemini. Sanitized response text:", sanitizedText);
         if (e instanceof Error) {
             throw new Error(`Invalid JSON response from API: ${e.message}`);
         }
@@ -95,20 +95,13 @@ const noteBodySchema = {
     required: ['content', 'quotes', 'source'],
 };
 
-// Schema for Step 3: Interlinking and final output
-const finalNotesSchema = {
-    type: Type.ARRAY,
-    items: {
-        type: Type.OBJECT,
-        properties: {
-            id: { type: Type.STRING },
-            title: { type: Type.STRING },
-            content: { type: Type.STRING, description: 'The explanation of the concept, now with [[links]].' },
-            quotes: { type: Type.ARRAY, items: { type: Type.STRING } },
-            source: { type: Type.STRING }
-        },
-        required: ['id', 'title', 'content', 'quotes', 'source'],
-    }
+// Schema for Step 3: Interlinking a single note
+const singleNoteLinkSchema = {
+    type: Type.OBJECT,
+    properties: {
+        content: { type: Type.STRING, description: 'The revised content of the note with [[links]] added.' }
+    },
+    required: ['content'],
 };
 
 
@@ -141,24 +134,24 @@ const generateSingleNoteBody = async (bookContent: string, title: string): Promi
     return safeParseJsonResponse<Omit<UnlinkedNote, 'title'>>(response);
 };
 
-// Phase 3: Take all generated notes and add interlinks
-const interlinkNotes = async (notes: UnlinkedNote[]): Promise<Note[]> => {
-    const notesWithTempIds = notes.map((note, index) => ({
-        ...note,
-        id: `note_${index.toString().padStart(3, '0')}`
-    }));
+// Phase 3 Helper: Take one note and add interlinks to it
+const interlinkSingleNote = async (noteToLink: UnlinkedNote, allTitles: string[]): Promise<string> => {
+    const otherTitles = allTitles.filter(t => t !== noteToLink.title);
+    const prompt = `Note Content to Revise:\n${noteToLink.content}\n\nList of Available Link Targets:\n${JSON.stringify(otherTitles, null, 2)}`;
 
     const response = await callGeminiWithRetries(() => ai.models.generateContent({
         model: "gemini-2.5-flash",
-        contents: JSON.stringify(notesWithTempIds, null, 2),
+        contents: prompt,
         config: {
-            systemInstruction: INTERLINK_NOTES_PROMPT,
+            systemInstruction: INTERLINK_SINGLE_NOTE_PROMPT,
             responseMimeType: "application/json",
-            responseSchema: finalNotesSchema,
+            responseSchema: singleNoteLinkSchema,
         },
     }));
-    return safeParseJsonResponse<Note[]>(response);
-}
+
+    const parsed = safeParseJsonResponse<{content: string}>(response);
+    return parsed.content;
+};
 
 // Orchestrator function that runs the full pipeline
 export const processBookWithGemini = async (
@@ -200,19 +193,29 @@ export const processBookWithGemini = async (
         }
         state = { ...state, unlinkedNotes };
     
-        // Phase 3: Interlink notes
+        // Phase 3: Iteratively Interlink notes
         if (state.status !== 'completed' || state.finalNotes.length === 0) {
-            const stage = "Phase 3/3: Weaving the knowledge graph...";
-            onProgress({ stage });
+            const finalNotes: Note[] = [];
+            const allNoteTitles = state.unlinkedNotes.map(n => n.title);
+
+            for (let i = 0; i < state.unlinkedNotes.length; i++) {
+                const noteToLink = state.unlinkedNotes[i];
+                const stage = `Phase 3/3: Interlinking note ${i + 1}/${state.unlinkedNotes.length}: "${noteToLink.title.substring(0, 40)}..."`;
+                onProgress({ stage });
+
+                const newContent = await interlinkSingleNote(noteToLink, allNoteTitles);
+
+                finalNotes.push({
+                    ...noteToLink,
+                    id: `note_${i.toString().padStart(3, '0')}`,
+                    content: newContent,
+                });
+                
+                if (i < state.unlinkedNotes.length - 1) {
+                    await delay(1500);
+                }
+            }
             
-            const linkedNotesWithIds = await interlinkNotes(state.unlinkedNotes);
-
-            // Ensure IDs are unique if the model fails to do so
-            const finalNotes = linkedNotesWithIds.map((note, index) => ({
-                ...note,
-                id: `note_${index.toString().padStart(3, '0')}`
-            }));
-
             state = { ...state, finalNotes };
             onProgress({ finalNotes, status: 'completed', stage: '' });
         }

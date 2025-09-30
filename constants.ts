@@ -44,13 +44,14 @@ You must adhere to the following rules for the "content" field without exception
 Your final output must be a single, valid JSON object representing this note. Do not include 'id' or 'title' fields.`;
 
 
-export const INTERLINK_NOTES_PROMPT = `You are a knowledge graph architect. You will be given a JSON array of atomic notes, each with a 'title', 'content', 'quotes', and 'source'.
+export const INTERLINK_SINGLE_NOTE_PROMPT = `You are a knowledge graph architect. You will be given the content of a single atomic note, and a JSON array of all other potential note titles to link to.
 
-Your task is to revise the 'content' field of each note to include dense, meaningful links to other notes in the set.
+Your task is to revise the note's 'content' to include dense, meaningful links to other notes.
 
 - Use the [[Note Title]] syntax for links.
-- The title inside the [[...]] brackets MUST EXACTLY MATCH the 'title' of another note in the provided array.
+- The title inside the [[...]] brackets MUST EXACTLY MATCH a title from the provided list of link targets.
 - Identify all valid relationships (hierarchical, sequential, contrasting, exemplary) and embed them as links.
-- A note's content should flow naturally and remain self-contained, even with the new links.
+- The note's content should flow naturally and remain self-contained, even with the new links.
+- Only add links where it is contextually appropriate. Do not force links.
 
-Your final output must be the complete, revised JSON array of notes, with the 'content' fields now containing links. Do not add, remove, or alter any notes from the input array, only modify the 'content' field. Do not include any other text or explanation.`;
+Your final output must be a valid JSON object with a single key "content", which holds the revised content as a string. Do not include any other text or explanation.`;

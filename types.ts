@@ -28,9 +28,17 @@ export interface ProcessingState {
 }
 
 
+// FIX: The D3 force simulation adds properties like 'x', 'y', 'fx', and 'fy' to
+// node objects. Although D3Node extends SimulationNodeDatum (which should provide
+// these properties), they are made explicit here to resolve TypeScript errors
+// where the compiler fails to recognize them.
 export interface D3Node extends SimulationNodeDatum {
     id: string;
     title: string;
+    x?: number;
+    y?: number;
+    fx?: number | null;
+    fy?: number | null;
 }
 
 // FIX: Remove incorrect overrides for `source` and `target`.
